@@ -22,6 +22,7 @@ import torch
 import time
 import glob
 import random
+import re
 import cv2
 import argparse
 import tempfile
@@ -186,7 +187,37 @@ def prepare_input(
     return views
 
 
-def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+def load_saved_outputs(outdir):
+    from src.dust3r.utils.geometry import depthmap_to_absolute_camera_coordinates
+
+    num_views = -1
+    for folder in ["depth", "conf", "color", "camera"]:
+        path_to_folder = os.path.join(outdir, folder)
+        if not os.path.exists(path_to_folder): return False
+        if num_views == -1: num_views = len(os.listdir(path_to_folder))
+        else: assert num_views == (new_num := len(os.listdir(path_to_folder))), \
+                    f"{path_to_folder} has only {new_num} views (previously {num_views})"
+    pts3ds, confs, colors, cam_poses, cam_intrs = [], [], [], [], []
+    for f_id in range(num_views):
+        depth = np.load(os.path.join(outdir, "depth", f"{f_id:06d}.npy"))
+        confs.append(np.load(os.path.join(outdir, "conf", f"{f_id:06d}.npy"))[np.newaxis, ...])
+        colors.append((iio.imread(os.path.join(outdir, "color", f"{f_id:06d}.png")).astype(float) / 255)[np.newaxis, ...])
+        cam_info = np.load(os.path.join(outdir, "camera", f"{f_id:06d}.npz"))
+        cam_poses.append(cam_info["pose"])
+        cam_intrs.append(cam_info["intrinsics"])
+        pts3d, _ = depthmap_to_absolute_camera_coordinates(depth, cam_info["intrinsics"], cam_info["pose"])
+        pts3ds.append(pts3d)
+    
+    cam_poses, cam_intrs = np.stack(cam_poses), np.stack(cam_intrs)
+    focal = cam_intrs[:, 0, 0]
+    pp = cam_intrs[:, :2, 2]
+    R_c2w = cam_poses[:, :3, :3]
+    t_c2w = cam_poses[:, :3, 3]
+    cam_dict = {"focal": focal, "pp": pp, "R": R_c2w, "t": t_c2w}
+    return pts3ds, colors, confs, cam_dict
+    
+
+def prepare_output(outputs, state_args, feat, view_attns, outdir, revisit=1, use_pose=True):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -268,12 +299,19 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
     os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
     os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
+    os.makedirs(os.path.join(outdir, "state"), exist_ok=True)
+    os.makedirs(os.path.join(outdir, "img_tokens"), exist_ok=True)
+    os.makedirs(os.path.join(outdir, "cross_attns"), exist_ok=True)
+
     for f_id in range(len(pts3ds_self)):
         depth = depths_tosave[f_id].cpu().numpy()
         conf = conf_self_tosave[f_id].cpu().numpy()
         color = colors_tosave[f_id].cpu().numpy()
         c2w = cam2world_tosave[f_id].cpu().numpy()
         intrins = intrinsics_tosave[f_id].cpu().numpy()
+        state_arg_cpu = [state_args[f_id + 1][arg_i][0].cpu().numpy() for arg_i in range(len(state_args[f_id + 1]))]
+        state_info = dict(zip(["state_feat", "state_pos", "init_state_feat", "mem", "init_mem"], state_arg_cpu))   # state_feat: array[768 x 768]  mem: array[256 x 1536]
+        branches_attn = {branch: attn.numpy() for branch, attn in view_attns[f_id].items()}
         np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
         np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
         iio.imwrite(
@@ -285,13 +323,20 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
             pose=c2w,
             intrinsics=intrins,
         )
+        np.savez(os.path.join(outdir, "state", f"{f_id + 1:06d}.npz"), **state_info)
+        np.save(os.path.join(outdir, "img_tokens", f"{f_id:06d}.npy"), feat[f_id][0].cpu().numpy())
+        np.savez(os.path.join(outdir, "cross_attns", f"{f_id:06d}.npz"), **branches_attn)
+    state0_arg_cpu = [state_args[0][arg_i][0].detach().cpu().numpy() for arg_i in range(len(state_args[0]))]
+    state0_info = dict(zip(["state_feat", "state_pos", "init_state_feat", "mem", "init_mem"], state0_arg_cpu))
+    np.savez(os.path.join(outdir, "state", f"{0:06d}.npz"), **state0_info)
 
     return pts3ds_other, colors, conf_other, cam_dict
 
 
 def parse_seq_path(p):
     if os.path.isdir(p):
-        img_paths = sorted(glob.glob(f"{p}/*"))
+        natural_sort = lambda text: [int(c) if c.isdigit() else c for c in re.split(r"(\d+)", text)]
+        img_paths = sorted(glob.glob(f"{p}/*"), key=natural_sort)
         tmpdirname = None
     else:
         cap = cv2.VideoCapture(p)
@@ -336,11 +381,71 @@ def run_inference(args):
 
     # Add the checkpoint path (required for model imports in the dust3r package).
     add_path_to_dust3r(args.model_path)
-
+    from viser_utils import PointCloudViewer
+    
+    if os.path.isfile(args.output_dir):
+        save_params = np.load(args.output_dir, allow_pickle=True).item()    # Array with single dictionary from mv_recon's eval launch script
+        images_all = np.expand_dims(save_params["images_all"], axis=1)
+        pts_all = save_params["pts_all"]
+        pts_all[..., 1] *= -1    # Flip the point cloud so it's not upside down, hacky solution
+        masks_all = np.expand_dims(save_params["masks_all"], axis=1)
+        edge_colors = [None] * len(pts_all)
+        print(f"Launching point cloud viewer with evaluation outputs from {args.output_dir}...")
+        viewer = PointCloudViewer(
+            None,
+            None,
+            pts_all,
+            images_all,
+            masks_all,
+            None,
+            device=device,
+            edge_color_list=edge_colors,
+            show_camera=False,
+            vis_threshold=0,
+            size = args.size
+        )
+        viewer.run()
+    if load_res := load_saved_outputs(args.output_dir):
+        # Create and run the point cloud viewer.
+        pts3ds, colors, confs, cam_dict = load_res
+        """ 
+        pts3ds2, colors2, confs2, cam_dict2 = load_saved_outputs("test_sequences/cont_seq_cut3r_restart/cut3r_2nd_half")
+        for i in range(len(pts3ds2)):
+            pts3ds2[i] = pts3ds2[i] @ cam_dict["R"][-len(pts3ds2)] + cam_dict["t"][-len(pts3ds2)]
+        pts3ds = pts3ds[-len(pts3ds2):]
+        colors = colors[-len(pts3ds2):]
+        confs = confs[-len(pts3ds2):]
+        pts3ds.extend(pts3ds2)
+        colors.extend(colors2)
+        confs.extend(confs2)
+        for k in cam_dict:
+            if k == "R":
+                cam_dict2[k] = cam_dict2[k] @ cam_dict[k][-len(pts3ds2)]
+            if k == "t":
+                cam_dict2[k] = cam_dict2[k] + cam_dict[k][-len(pts3ds2)]
+            cam_dict[k] = np.concatenate([cam_dict[k][-len(pts3ds2):], cam_dict2[k]])
+        edge_colors = [(171, 209, 46)] * (len(pts3ds) - len(pts3ds2)) + [(115, 51, 189)] * len(pts3ds2)
+         """
+        edge_colors = [None] * len(pts3ds)
+        print(f"Launching point cloud viewer with cached data from {args.output_dir}...")
+        viewer = PointCloudViewer(
+            None,
+            None,
+            pts3ds,
+            colors,
+            confs,
+            cam_dict,
+            device=device,
+            edge_color_list=edge_colors,
+            show_camera=True,
+            vis_threshold=args.vis_threshold,
+            size = args.size
+        )
+        viewer.run()
+    
     # Import model and inference functions after adding the ckpt path.
     from src.dust3r.inference import inference, inference_recurrent
     from src.dust3r.model import ARCroco3DStereo
-    from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
     img_paths, tmpdirname = parse_seq_path(args.seq_path)
@@ -371,7 +476,7 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference(views, model, device)
+    outputs, state_args, feat, view_attns = inference(views, model, device)
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
@@ -381,7 +486,7 @@ def run_inference(args):
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
+        outputs, state_args, feat, view_attns, args.output_dir, 1, True
     )
 
     # Convert tensors to numpy arrays for visualization.
@@ -390,6 +495,7 @@ def run_inference(args):
     edge_colors = [None] * len(pts3ds_to_vis)
 
     # Create and run the point cloud viewer.
+    
     print("Launching point cloud viewer...")
     viewer = PointCloudViewer(
         model,

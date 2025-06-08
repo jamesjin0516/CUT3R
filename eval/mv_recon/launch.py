@@ -16,6 +16,9 @@ import tempfile
 from tqdm import tqdm
 
 
+COMPLETE_KITCHEN_REVISIT_TEST = ["complete_kitchen " + " ".join(str(ind) for ind in list(range(0, 200, 20)) + list(range(600, 800, 10)) + list(range(1050, 1150, 20)))]
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
     parser.add_argument(
@@ -53,22 +56,25 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        "7scenes": SevenScenes(
-            split="test",
-            ROOT="./data/7scenes",
-            resolution=resolution,
-            num_seq=1,
-            full_video=True,
-            kf_every=200,
-        ),  # 20),
+        # "7scenes": SevenScenes(
+        #     split="test",
+        #     ROOT="./data/7scenes",
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=200,
+        # ),  # 20),
         "NRGBD": NRGBD(
             split="test",
             ROOT="./data/neural_rgbd",
             resolution=resolution,
             num_seq=1,
+            test_id="complete_kitchen",
             full_video=True,
-            kf_every=500,
-        ),
+            tuple_list=COMPLETE_KITCHEN_REVISIT_TEST,
+            kf_every=50,
+            shuffle_views=0
+        )
     }
 
     accelerator = Accelerator()

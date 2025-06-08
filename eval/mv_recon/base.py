@@ -33,6 +33,7 @@ class BaseStereoViewDataset:
         transform=ImgNorm,
         aug_crop=False,
         seed=None,
+        shuffle_views=0
     ):
         self.num_views = 2
         self.split = split
@@ -44,6 +45,7 @@ class BaseStereoViewDataset:
 
         self.aug_crop = aug_crop
         self.seed = seed
+        self.shuffle_views = shuffle_views
 
     def __len__(self):
         return len(self.scenes)
@@ -88,6 +90,24 @@ class BaseStereoViewDataset:
             ar_idx
         ]  # DO NOT CHANGE THIS (compatible with BatchedRandomSampler)
         views = self._get_views(idx, resolution, self._rng)
+
+        for view_i in range(len(views)):
+            views[view_i]["index"] = view_i
+
+        if self.shuffle_views > 0:
+            view_shuffle = []
+            block_inds = np.arange(len(views) // self.shuffle_views)
+            np.random.shuffle(block_inds)
+            for block_ind in block_inds:
+                block_start = block_ind * self.shuffle_views
+                view_shuffle.extend(views[block_start: block_start + self.shuffle_views])
+            view_shuffle.extend(views[len(block_inds) * self.shuffle_views :])
+            views = view_shuffle
+        
+        shuffle_indices = []
+        for view in views:
+            shuffle_indices.append(view["index"])
+        assert(set(shuffle_indices) == set(range(view_i + 1)))
 
         # check data-types
         for v, view in enumerate(views):

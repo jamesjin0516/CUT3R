@@ -7,6 +7,7 @@ import matplotlib as mpl
 import cv2
 import numpy as np
 import matplotlib.cm as cm
+from PIL import Image, ImageDraw, ImageFont
 import viser
 import viser.transforms as tf
 import time
@@ -337,7 +338,8 @@ class PointCloudViewer:
         port=8080,
         show_camera=True,
         vis_threshold=1,
-        size=512
+        size=512,
+        only_show_edge=False
     ):
         self.model = model
         self.size=size
@@ -348,6 +350,11 @@ class PointCloudViewer:
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
+        if pc_list is None:
+            pc_list = [None for _ in range(len(cam_dict["focal"]))]
+            self.has_pointcloud = False
+        else:
+            self.has_pointcloud = True
         self.pcs, self.all_steps = self.read_data(
             pc_list, color_list, conf_list, edge_color_list
         )
@@ -355,6 +362,7 @@ class PointCloudViewer:
         self.num_frames = len(self.all_steps)
         self.image_mask = image_mask
         self.show_camera = show_camera
+        self.only_show_edge = only_show_edge
         self.on_replay = False
         self.vis_pts_list = []
         self.traj_list = []
@@ -626,7 +634,12 @@ class PointCloudViewer:
         conf=None,
         edge_color=[0.251, 0.702, 0.902],
         set_border_color=False,
+        only_show_edge=False
     ):
+        if only_show_edge:
+            middle_mask = np.ones(pc.shape[:2], dtype=bool)
+            middle_mask[10 : pc.shape[0] - 10, 10 : pc.shape[1] - 10] = False
+            pc = pc[middle_mask]
 
         pred_pts = pc.reshape(-1, 3)  # [N, 3]
 
@@ -636,22 +649,27 @@ class PointCloudViewer:
 
             color = np.zeros((pred_pts.shape[0], 3))
             color[:, 2] = 1
+        elif only_show_edge:
+            color = color[:, middle_mask][0]
         else:
             color = color.reshape(-1, 3)
         if conf is not None:
-            conf = conf[0].reshape(-1)
+            if only_show_edge:
+                conf = conf[:, middle_mask][0]
+            else:
+                conf = conf[0].reshape(-1)
             pred_pts = pred_pts[conf > self.vis_threshold]
             color = color[conf > self.vis_threshold]
         return pred_pts, color
 
-    def add_pc(self, step):
+    def add_pc(self, step, only_show_edge):
         pc = self.pcs[step]["pc"]
         color = self.pcs[step]["color"]
         conf = self.pcs[step]["conf"]
         edge_color = self.pcs[step].get("edge_color", None)
 
         pred_pts, color = self.parse_pc_data(
-            pc, color, conf, edge_color, set_border_color=True
+            pc, color, conf, edge_color, set_border_color=True, only_show_edge=only_show_edge
         )
 
         self.vis_pts_list.append(pred_pts)
@@ -670,7 +688,12 @@ class PointCloudViewer:
         pp = cam["pp"][step]
         R = cam["R"][step]
         t = cam["t"][step]
-
+        edge_color = self.pcs[step].get("edge_color", None)
+        """ ind_img = Image.new("RGB", (640, 480), "white")
+        ind_drawer = ImageDraw.Draw(ind_img)
+        ind_drawer.text((260, 180), str(step), "black", ImageFont.load_default(120))
+        ind_img_arr = np.array(ind_img)
+        ind_img.close() """
         q = tf.SO3.from_matrix(R).wxyz
         fov = 2 * np.arctan(pp[0] / focal)
         aspect = pp[0] / pp[1]
@@ -683,7 +706,8 @@ class PointCloudViewer:
                 wxyz=q,
                 position=t,
                 scale=0.1,
-                color=(50, 205, 50),
+                color=edge_color if edge_color is not None else (50, 205, 50),
+                # image=ind_img_arr
             )
         )
 
@@ -750,7 +774,8 @@ class PointCloudViewer:
                     show_axes=False,
                 )
             )
-            self.add_pc(step)
+            if self.has_pointcloud:
+                self.add_pc(step, self.only_show_edge)
             if self.show_camera:
                 self.add_camera(step)
 

@@ -415,7 +415,7 @@ class NRGBD(BaseStereoViewDataset):
     def load_all_scenes(self, base_dir):
 
         scenes = [
-            d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))
+            d for d in sorted(os.listdir(base_dir)) if os.path.isdir(os.path.join(base_dir, d))
         ]
 
         if self.test_id is not None:

@@ -72,10 +72,10 @@ def loss_of_one_batch(
 
     with torch.cuda.amp.autocast(enabled=not inference):
         if inference:
-            output, state_args = model(batch, ret_state=True)
+            output, state_args, feat, view_attns = model(batch, ret_state=True, attn_side=["state", "image"])
             preds, batch = output.ress, output.views
             result = dict(views=batch, pred=preds)
-            return result[ret] if ret else result, state_args
+            return result[ret] if ret else result, state_args, feat, view_attns
         else:
             output = model(batch)
             preds, batch = output.ress, output.views
@@ -233,9 +233,9 @@ def inference(groups, model, device, verbose=True):
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")
 
-    res, state_args = loss_of_one_batch(groups, model, None, None, inference=True)
+    res, state_args, feat, view_attns = loss_of_one_batch(groups, model, None, None, inference=True)
     result = to_cpu(res)
-    return result, state_args
+    return result, state_args, feat, view_attns
 
 
 @torch.no_grad()

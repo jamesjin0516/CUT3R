@@ -657,7 +657,7 @@ class ARCroco3DStereo(CroCoNet):
             full_pos.chunk(len(views), dim=0),
         )
 
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
+    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, attn_side):
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
         f_img = self.decoder_embed(f_img)
@@ -666,35 +666,57 @@ class ARCroco3DStereo(CroCoNet):
             f_img = torch.cat([f_pose, f_img], dim=1)
             pos_img = torch.cat([pos_pose, pos_img], dim=1)
         final_output.append((f_state, f_img))
+        layers_attn = []
         for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
             if (
                 self.gradient_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                f_state, _ = checkpoint(
+                state_dec = checkpoint(
                     blk_state,
                     *final_output[-1][::+1],
                     pos_state,
                     pos_img,
                     use_reentrant=not self.fixed_input_length,
+                    return_attn="state" in attn_side
                 )
-                f_img, _ = checkpoint(
+                img_dec = checkpoint(
                     blk_img,
                     *final_output[-1][::-1],
                     pos_img,
                     pos_state,
                     use_reentrant=not self.fixed_input_length,
+                    return_attn="image" in attn_side
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
-                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+                state_dec = blk_state(*final_output[-1][::+1], pos_state, pos_img, return_attn="state" in attn_side)
+                img_dec = blk_img(*final_output[-1][::-1], pos_img, pos_state, return_attn="image" in attn_side)
+            layer_attn = {}
+            if "state" in attn_side:
+                f_state, _, attn_state = state_dec
+                layer_attn["state"] = attn_state
+            else:
+                f_state, _ = state_dec
+            if "image" in attn_side:
+                f_img, _, attn_img = img_dec
+                layer_attn["image"] = attn_img
+            else:
+                f_img, _ = img_dec
+            if len(layer_attn) > 0:
+                layers_attn.append(layer_attn)
             final_output.append((f_state, f_img))
+        if len(layers_attn) > 0:
+            branches_attn = {}
+            for branch in layers_attn[0]:
+                branches_attn[branch] = torch.cat([layer_attn[branch] for layer_attn in layers_attn]).cpu()
         del final_output[1]  # duplicate with final_output[0]
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
             self.dec_norm(final_output[-1][1]),
         )
+        if len(layers_attn) > 0:
+            return *zip(*final_output), branches_attn
         return zip(*final_output)
 
     def _downstream_head(self, decout, img_shape, **kwargs):
@@ -722,12 +744,17 @@ class ARCroco3DStereo(CroCoNet):
         img_mask=None,
         reset_mask=None,
         update=None,
+        attn_side=[]
     ):
-        new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos
+        decoder_out = self._decoder(
+            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos, attn_side
         )
-        new_state_feat = new_state_feat[-1]
-        return new_state_feat, dec
+        if len(attn_side) > 0:
+            new_state_feat, dec, branches_attn = decoder_out
+            return new_state_feat[-1], dec, branches_attn
+        else:
+            new_state_feat, dec = decoder_out
+            return new_state_feat[-1], dec
 
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
@@ -813,15 +840,16 @@ class ARCroco3DStereo(CroCoNet):
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
         return res, (state_feat, mem)
 
-    def _forward_impl(self, views, ret_state=False):
-        shape, feat_ls, pos = self._encode_views(views)
-        feat = feat_ls[-1]
+    def _forward_impl(self, views, ret_state=False, attn_side=[]):
+        shape, feat_ls, pos = self._encode_views(views)    # shape = List[Tensor(1x2)]  # feat_ls = List[feat]
+        feat = feat_ls[-1]    # feat = List[Tensor(1 x 768 x 1024)]    pos = List[Tensor(1 x 768 x 2)]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
         all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
         ress = []
+        views_attns = []
         for i in range(len(views)):
             feat_i = feat[i]
             pos_i = pos[i]
@@ -837,7 +865,8 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 pose_feat_i = None
                 pose_pos_i = None
-            new_state_feat, dec = self._recurrent_rollout(
+            
+            decoder_out = self._recurrent_rollout(    # new_state_feat = Tensor(1 x 768 x 768)
                 state_feat,
                 state_pos,
                 feat_i,
@@ -848,8 +877,14 @@ class ARCroco3DStereo(CroCoNet):
                 img_mask=views[i]["img_mask"],
                 reset_mask=views[i]["reset"],
                 update=views[i].get("update", None),
+                attn_side=attn_side
             )
-            out_pose_feat_i = dec[-1][:, 0:1]
+            if len(attn_side) > 0:
+                new_state_feat, dec, branches_attn = decoder_out
+                views_attns.append(branches_attn)
+            else:
+                new_state_feat, dec = decoder_out
+            out_pose_feat_i = dec[-1][:, 0:1]    # decoded pose token = Tensor(1 x 1 x 768)
             new_mem = self.pose_retriever.update_mem(
                 mem, global_img_feat_i, out_pose_feat_i
             )
@@ -887,16 +922,28 @@ class ARCroco3DStereo(CroCoNet):
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )
-        if ret_state:
-            return ress, views, all_state_args
-        return ress, views
-
-    def forward(self, views, ret_state=False):
-        if ret_state:
-            ress, views, state_args = self._forward_impl(views, ret_state=ret_state)
-            return ARCroco3DStereoOutput(ress=ress, views=views), state_args
+        if len(views_attns) > 0:
+            ret_vals = (ress, views, views_attns)
         else:
-            ress, views = self._forward_impl(views, ret_state=ret_state)
+            ret_vals = (ress, views)
+        if ret_state:
+            return ret_vals, all_state_args, feat
+        return ret_vals
+
+    def forward(self, views, ret_state=False, attn_side=[]):
+        ret_vals = self._forward_impl(views, ret_state=ret_state, attn_side=attn_side)
+        if ret_state:
+            ret_vals, state_args, feat = ret_vals
+            ress, views = ret_vals[:2]
+            if len(ret_vals) == 3:
+                views_attns = ret_vals[2]
+                return ARCroco3DStereoOutput(ress=ress, views=views), state_args, feat, views_attns
+            return ARCroco3DStereoOutput(ress=ress, views=views), state_args, feat
+        else:
+            ress, views = ret_vals[:2]
+            if len(ret_vals) == 3:
+                views_attns = ret_vals[2]
+                return ARCroco3DStereoOutput(ress=ress, views=views), views_attns
             return ARCroco3DStereoOutput(ress=ress, views=views)
 
     def inference_step(

@@ -194,7 +194,7 @@ class CrossAttention(nn.Module):
 
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, set_attn=False):
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
@@ -240,6 +240,12 @@ class CrossAttention(nn.Module):
 
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        # https://github.com/pytorch/pytorch/issues/119811
+        if set_attn:
+            v_id = torch.eye(Nv, device=v.device).repeat(B, self.num_heads, 1, 1)
+            attn_weights = scaled_dot_product_attention(q, k, v_id, dropout_p=0, scale=self.scale)
+            self.attn_weights = attn_weights
         return x
 
 
@@ -289,11 +295,13 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
+    def forward(self, x, y, xpos, ypos, return_attn=False):
         x = x + self.drop_path(self.attn(self.norm1(x), xpos))
         y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, return_attn))
         x = x + self.drop_path(self.mlp(self.norm3(x)))
+        if return_attn:
+            return x, y, self.cross_attn.attn_weights
         return x, y
 
 
